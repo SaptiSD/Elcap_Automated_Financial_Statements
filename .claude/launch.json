@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "elcap-web",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "streamlit", "run", "app.py", "--server.port", "8532", "--server.headless", "true"],
+      "port": 8532,
+      "autoPort": false
+    }
+  ]
+}
