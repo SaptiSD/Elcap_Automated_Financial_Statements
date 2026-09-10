@@ -60,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="scorecard template to fill "
                              "(default: template/ElCap Scorecard Template.xlsx)")
     parser.add_argument("--cli", default=DEFAULT_CLI,
-                        choices=["auto", "api", "opencode", "claude", "codex", "gemini"],
+                        choices=["auto", "api", "compat", "opencode", "claude", "codex", "gemini"],
                         help="LLM CLI backend (default: %(default)s)")
     parser.add_argument("--model", default=DEFAULT_MODEL, metavar="ID",
                         help="model id passed to the backend")

@@ -7,11 +7,15 @@ Supported backends (selected via ``ELCAP_LLM_CLI``, default ``auto``):
                  a hosted web server, where no CLI is installed and nobody is
                  logged in; ``auto`` prefers it whenever a key is set.
 
+- ``compat``     any OpenAI-compatible gateway (Open WebUI, LiteLLM, vLLM, a
+                 university or company AI service): POST /chat/completions
+                 with ``ELCAP_COMPAT_BASE_URL`` / ``ELCAP_COMPAT_API_KEY``.
 - ``opencode``   `opencode run` (stdin prompt, NDJSON events on stdout)
 - ``claude``     Claude Code `claude -p` (stdin prompt, reply on stdout)
 - ``codex``      OpenAI Codex `codex exec -` (stdin prompt, final msg on stdout)
 - ``gemini``     Google Gemini CLI (non-TTY stdin = single prompt)
-- ``auto``       the API when a key is set, else the first CLI available
+- ``auto``       the Anthropic API if a key is set, else a configured gateway,
+                 else the first CLI available
 
 Every backend receives the prompt on **stdin** so it works with long
 statements even where the OS limits command-line length (Windows: ~32 KB).
@@ -233,7 +237,7 @@ API_MAX_TOKENS = 16_000
 #: return no scorecard at all, so the fallback is left on.
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
-ALL_BACKENDS = (API_BACKEND,) + PREFERRED_ORDER
+ALL_BACKENDS = (API_BACKEND, "compat") + PREFERRED_ORDER
 
 
 def api_key_available() -> bool:
@@ -313,6 +317,150 @@ def _is_bad_request(exc: Exception) -> bool:
             or type(exc).__name__ == "BadRequestError")
 
 
+# --------------------------------------------------------------------------
+# The OpenAI-compatible gateway backend
+#
+# University and company AI gateways (Open WebUI, LiteLLM, vLLM, Azure OpenAI
+# and the rest) nearly all speak POST /chat/completions rather than the
+# Anthropic Messages API, and issue their own keys. This backend sends the
+# same prompt there. The reply is parsed by the same code, so a gateway
+# fronting Claude produces the same scorecard as the Anthropic API does.
+# --------------------------------------------------------------------------
+
+#: Backend name for an OpenAI-compatible gateway.
+COMPAT_BACKEND = "compat"
+
+#: Environment variables that configure it.
+COMPAT_BASE_URL_VAR = "ELCAP_COMPAT_BASE_URL"
+COMPAT_KEY_VAR = "ELCAP_COMPAT_API_KEY"
+COMPAT_MODEL_VAR = "ELCAP_COMPAT_MODEL"
+#: A JSON object of extra request headers. This is how a gateway behind
+#: Cloudflare Access is reached: put its service-token pair
+#: ("CF-Access-Client-Id" / "CF-Access-Client-Secret") in here.
+COMPAT_HEADERS_VAR = "ELCAP_COMPAT_HEADERS"
+
+
+def compat_configured() -> bool:
+    """Whether a compatible gateway has both a base URL and a key."""
+    return bool(os.environ.get(COMPAT_BASE_URL_VAR, "").strip()
+                and os.environ.get(COMPAT_KEY_VAR, "").strip())
+
+
+class _CompatRunner:
+    """Send the prompt to an OpenAI-compatible /chat/completions endpoint."""
+
+    cli = COMPAT_BACKEND
+
+    def __init__(self, model: str | None = None) -> None:
+        self.base_url = os.environ.get(COMPAT_BASE_URL_VAR, "").strip().rstrip("/")
+        self.api_key = os.environ.get(COMPAT_KEY_VAR, "").strip()
+        self.model = (model or os.environ.get(COMPAT_MODEL_VAR) or "").strip()
+
+    def run(self, prompt: str, timeout_seconds: int) -> str:
+        import requests
+
+        if not self.base_url or not self.api_key:
+            raise LLMExtractionBackendError(
+                "The compatible-gateway backend needs both a base URL and an "
+                f"API key ({COMPAT_BASE_URL_VAR} and {COMPAT_KEY_VAR}).")
+        if not self.model:
+            raise LLMExtractionBackendError(
+                "The compatible-gateway backend needs a model name "
+                f"({COMPAT_MODEL_VAR}); gateways do not agree on a default.")
+
+        try:
+            response = requests.post(
+                self._endpoint(),
+                headers=self._headers(),
+                json={
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    # Transcription, not composition: the same statement should
+                    # read the same way twice.
+                    "temperature": 0,
+                    "stream": False,
+                },
+                timeout=timeout_seconds,
+            )
+        except Exception as exc:
+            raise LLMExtractionBackendError(
+                f"Could not reach {self.base_url}: {exc}") from exc
+
+        if response.status_code != 200:
+            raise LLMExtractionBackendError(self._explain(response))
+        return self._reply(response)
+
+    def _endpoint(self) -> str:
+        # Accept a base URL given with or without the /chat/completions tail,
+        # because every gateway documents it differently.
+        if self.base_url.endswith("/chat/completions"):
+            return self.base_url
+        return f"{self.base_url}/chat/completions"
+
+    def _headers(self) -> dict:
+        headers = {"Authorization": f"Bearer {self.api_key}",
+                   "Content-Type": "application/json"}
+        raw = os.environ.get(COMPAT_HEADERS_VAR, "").strip()
+        if raw:
+            try:
+                extra = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise LLMExtractionBackendError(
+                    f"{COMPAT_HEADERS_VAR} is not valid JSON: {exc}") from exc
+            if not isinstance(extra, dict):
+                raise LLMExtractionBackendError(
+                    f"{COMPAT_HEADERS_VAR} must be a JSON object of headers.")
+            headers.update({str(k): str(v) for k, v in extra.items()})
+        return headers
+
+    def _explain(self, response) -> str:
+        """Turn a failed response into something the user can act on."""
+        body = (response.text or "")[:300]
+        # A gateway behind Cloudflare Access answers an unauthenticated call
+        # with its sign-in page, not a 401. Without this the user sees "not
+        # valid JSON" and has no idea their key was never even looked at.
+        if ("cloudflareaccess" in response.url
+                or "cloudflareaccess" in body
+                or "Cloudflare Access" in body):
+            return (
+                f"{self.base_url} is behind Cloudflare Access, which "
+                "redirected the request to a sign-in page before the gateway "
+                "saw the API key. A key alone cannot get through: the "
+                "deployment also needs a Cloudflare Access service token, set "
+                f"as CF-Access-Client-Id and CF-Access-Client-Secret in "
+                f"{COMPAT_HEADERS_VAR}. Ask whoever runs the gateway for one.")
+        if response.status_code in (401, 403):
+            return (f"{self.base_url} rejected the API key "
+                    f"({response.status_code}). {body}")
+        if response.status_code == 404:
+            return (f"No /chat/completions endpoint at {self._endpoint()} "
+                    f"(404). Check the base URL. {body}")
+        return f"{self.base_url} returned {response.status_code}: {body}"
+
+    def _reply(self, response) -> str:
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise LLMExtractionBackendError(
+                f"{self.base_url} did not return JSON: "
+                f"{(response.text or '')[:300]}") from exc
+        try:
+            message = payload["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LLMExtractionBackendError(
+                f"Unexpected reply shape from {self.base_url}: "
+                f"{json.dumps(payload)[:300]}") from exc
+        content = message.get("content")
+        if isinstance(content, list):
+            # Some gateways return the OpenAI "parts" shape.
+            content = "".join(part.get("text", "") for part in content
+                              if isinstance(part, dict))
+        return (content or "").strip()
+
+    def describe(self) -> str:
+        return f"{self.base_url} (model={self.model})"
+
+
 
 class _LLMRunner:
     """Resolve a CLI backend and run a single prompt with it."""
@@ -339,7 +487,9 @@ class _LLMRunner:
                     return name
             raise LLMExtractionBackendError(
                 "No way to reach a model. Set ANTHROPIC_API_KEY to use the "
-                "Anthropic API, or install one of "
+                "Anthropic API, point ELCAP_COMPAT_BASE_URL/"
+                "ELCAP_COMPAT_API_KEY at an OpenAI-compatible gateway, or "
+                "install one of "
                 + ", ".join(PREFERRED_ORDER)
                 + " and set ELCAP_LLM_CLI to choose it explicitly."
             )
@@ -489,23 +639,31 @@ def _latest_message_text(events: list[dict]) -> str:
 def resolve_backend(cli: str) -> str:
     """Return the backend name that would be used for the given selection."""
     requested = (cli or "auto").strip().lower()
-    if requested == API_BACKEND:
-        return API_BACKEND
-    if requested == "auto" and api_key_available():
-        return API_BACKEND
+    if requested in (API_BACKEND, COMPAT_BACKEND):
+        return requested
+    if requested == "auto":
+        if api_key_available():
+            return API_BACKEND
+        if compat_configured():
+            return COMPAT_BACKEND
     return _LLMRunner(requested, model=None).cli
 
 
 def make_runner(cli: str, model: str | None = None):
-    """Build the runner for a backend selection, API or CLI."""
-    if resolve_backend(cli) == API_BACKEND:
+    """Build the runner for a backend selection: API, gateway, or CLI."""
+    resolved = resolve_backend(cli)
+    if resolved == API_BACKEND:
         return _ApiRunner(model=model)
+    if resolved == COMPAT_BACKEND:
+        return _CompatRunner(model=model)
     return _LLMRunner(cli, model=model)
 
 
 def available_backends() -> list[str]:
     """Backends that could actually run right now, best first."""
     ready = [API_BACKEND] if api_key_available() else []
+    if compat_configured():
+        ready.append(COMPAT_BACKEND)
     ready += [name for name in PREFERRED_ORDER if _find_cli(name) is not None]
     return ready
 

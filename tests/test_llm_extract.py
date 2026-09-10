@@ -256,3 +256,116 @@ def test_output_still_wins_over_a_nonzero_exit(cli):
     """A CLI that prints the answer then exits non-zero (deprecation notice,
     telemetry failure) must not lose the answer."""
     assert _output_to_reply(cli, '{"a": 1}', "warning", 1) == '{"a": 1}'
+
+
+# --------------------------------------------------------------------------
+# The OpenAI-compatible gateway backend
+#
+# No gateway is reachable from a test run, so these pin the parts that decide
+# whether a real one works: the URL we POST to, the headers we send, and how
+# we read the two reply shapes and the failures. The Cloudflare Access case
+# has its own test because that failure arrives as a 200 with a sign-in page,
+# which every generic error message reports as "not valid JSON".
+# --------------------------------------------------------------------------
+
+from llm_extract import (COMPAT_BASE_URL_VAR, COMPAT_HEADERS_VAR,  # noqa: E402
+                         COMPAT_KEY_VAR, COMPAT_MODEL_VAR, _CompatRunner,
+                         compat_configured)
+
+
+@pytest.fixture
+def gateway(monkeypatch):
+    monkeypatch.setenv(COMPAT_BASE_URL_VAR, "https://gw.example.edu/api")
+    monkeypatch.setenv(COMPAT_KEY_VAR, "sk-test")
+    monkeypatch.setenv(COMPAT_MODEL_VAR, "claude-sonnet-5")
+    monkeypatch.delenv(COMPAT_HEADERS_VAR, raising=False)
+    return _CompatRunner()
+
+
+class FakeResponse:
+    def __init__(self, status=200, payload=None, text="", url=""):
+        self.status_code = status
+        self._payload = payload
+        self.text = text or (json.dumps(payload) if payload is not None else "")
+        self.url = url or "https://gw.example.edu/api/chat/completions"
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
+
+
+def test_a_gateway_needs_both_a_url_and_a_key(monkeypatch):
+    monkeypatch.delenv(COMPAT_BASE_URL_VAR, raising=False)
+    monkeypatch.delenv(COMPAT_KEY_VAR, raising=False)
+    assert not compat_configured()
+    monkeypatch.setenv(COMPAT_BASE_URL_VAR, "https://gw.example.edu/api")
+    assert not compat_configured()
+    monkeypatch.setenv(COMPAT_KEY_VAR, "sk-test")
+    assert compat_configured()
+
+
+def test_the_completions_path_is_added_once(gateway, monkeypatch):
+    assert gateway._endpoint() == "https://gw.example.edu/api/chat/completions"
+    monkeypatch.setenv(COMPAT_BASE_URL_VAR,
+                       "https://gw.example.edu/api/chat/completions")
+    assert _CompatRunner()._endpoint() == \
+        "https://gw.example.edu/api/chat/completions"
+
+
+def test_extra_headers_are_merged_in(gateway, monkeypatch):
+    monkeypatch.setenv(COMPAT_HEADERS_VAR,
+                       '{"CF-Access-Client-Id": "abc", "CF-Access-Client-Secret": "xyz"}')
+    headers = _CompatRunner()._headers()
+    assert headers["Authorization"] == "Bearer sk-test"
+    assert headers["CF-Access-Client-Id"] == "abc"
+    assert headers["CF-Access-Client-Secret"] == "xyz"
+
+
+def test_unparseable_extra_headers_are_reported(gateway, monkeypatch):
+    monkeypatch.setenv(COMPAT_HEADERS_VAR, "CF-Access-Client-Id: abc")
+    with pytest.raises(LLMExtractionBackendError, match="not valid JSON"):
+        _CompatRunner()._headers()
+
+
+def test_a_missing_model_is_refused_before_the_request(gateway, monkeypatch):
+    monkeypatch.delenv(COMPAT_MODEL_VAR, raising=False)
+    with pytest.raises(LLMExtractionBackendError, match="needs a model"):
+        _CompatRunner().run("prompt", timeout_seconds=5)
+
+
+def test_the_reply_is_read_from_the_first_choice(gateway):
+    response = FakeResponse(payload={
+        "choices": [{"message": {"content": '  {"total_revenue": 1}  '}}]})
+    assert gateway._reply(response) == '{"total_revenue": 1}'
+
+
+def test_a_parts_shaped_reply_is_joined(gateway):
+    response = FakeResponse(payload={"choices": [{"message": {"content": [
+        {"type": "text", "text": '{"total_'},
+        {"type": "text", "text": 'revenue": 1}'},
+    ]}}]})
+    assert gateway._reply(response) == '{"total_revenue": 1}'
+
+
+def test_an_unexpected_reply_shape_says_so(gateway):
+    with pytest.raises(LLMExtractionBackendError, match="Unexpected reply shape"):
+        gateway._reply(FakeResponse(payload={"error": "no model"}))
+
+
+def test_a_cloudflare_access_bounce_is_named(gateway):
+    """Access answers an unauthenticated call with its sign-in page and a 200,
+    so the key is never even looked at. Saying 'not valid JSON' would send the
+    user hunting for a bug in their key."""
+    response = FakeResponse(
+        status=200, text="<title>Sign in - Cloudflare Access</title>",
+        url="https://example.cloudflareaccess.com/cdn-cgi/access/login/gw")
+    message = gateway._explain(response)
+    assert "Cloudflare Access" in message
+    assert "service token" in message
+    assert COMPAT_HEADERS_VAR in message
+
+
+def test_a_rejected_key_and_a_wrong_url_are_told_apart(gateway):
+    assert "rejected the API key" in gateway._explain(FakeResponse(status=401))
+    assert "Check the base URL" in gateway._explain(FakeResponse(status=404))

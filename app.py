@@ -27,8 +27,9 @@ from extract_pdf_text import (format_page_selection,  # noqa: E402
                               suggest_statement_pages)
 from fill_excel import AUDIT_LINE_ITEMS, BASIS_LABELS  # noqa: E402
 from llm_extract import (API_BACKEND, API_MODELS,  # noqa: E402
-                         DEFAULT_API_MODEL, api_key_available,
-                         available_backends)
+                         COMPAT_BACKEND, COMPAT_BASE_URL_VAR,
+                         COMPAT_HEADERS_VAR, COMPAT_KEY_VAR, COMPAT_MODEL_VAR,
+                         DEFAULT_API_MODEL, available_backends)
 from scorecard_pipeline import PipelineError, build_scorecard  # noqa: E402
 
 SAMPLE_PDF = os.path.join(HERE, "sample", "input", "Audited Financial Statements.pdf")
@@ -127,24 +128,33 @@ div[data-testid="stSidebar"] h2 { font-size: 1rem; }
 # Configuration and credentials
 # --------------------------------------------------------------------------
 
-def load_api_key() -> None:
-    """Move an API key from Streamlit secrets or the session into the env.
+#: Settings the app moves into the environment, where the extraction code
+#: reads them: the session box wins over the secrets store, which wins over
+#: whatever was already in the environment.
+CREDENTIAL_VARS = (
+    ("ANTHROPIC_API_KEY", "pasted_key"),
+    (COMPAT_BASE_URL_VAR, "gateway_url"),
+    (COMPAT_KEY_VAR, "gateway_key"),
+    (COMPAT_MODEL_VAR, "gateway_model"),
+    (COMPAT_HEADERS_VAR, "gateway_headers"),
+)
 
-    The extraction code reads ``ANTHROPIC_API_KEY`` from the environment, so
-    a key configured in the cloud's secrets store, or pasted into the sidebar
-    for one session, arrives the same way.
-    """
-    if st.session_state.get("pasted_key"):
-        os.environ["ANTHROPIC_API_KEY"] = st.session_state["pasted_key"].strip()
-        return
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return
-    try:
-        key = st.secrets.get("ANTHROPIC_API_KEY", "")
-    except Exception:                       # no secrets file configured
-        key = ""
-    if key:
-        os.environ["ANTHROPIC_API_KEY"] = str(key)
+
+def load_credentials() -> None:
+    """Publish keys from Streamlit secrets or the sidebar into the env."""
+    for env_var, state_key in CREDENTIAL_VARS:
+        typed = str(st.session_state.get(state_key) or "").strip()
+        if typed:
+            os.environ[env_var] = typed
+            continue
+        if os.environ.get(env_var):
+            continue
+        try:
+            stored = st.secrets.get(env_var, "")
+        except Exception:               # no secrets file configured
+            stored = ""
+        if stored:
+            os.environ[env_var] = str(stored)
 
 
 def sidebar() -> dict:
@@ -152,15 +162,19 @@ def sidebar() -> dict:
     with st.sidebar:
         st.markdown("## Reading engine")
         backends = available_backends()
+        engine = backends[0] if backends else None
 
-        if api_key_available():
+        if engine == API_BACKEND:
             st.success("Anthropic API key detected", icon=":material/check_circle:")
-        elif backends:
-            st.info(f"Using the local **{backends[0]}** CLI. Add an API key to "
-                    "run this anywhere.", icon=":material/terminal:")
+        elif engine == COMPAT_BACKEND:
+            st.success("Using the configured gateway",
+                       icon=":material/check_circle:")
+        elif engine:
+            st.info(f"Using the local **{engine}** CLI. Add a key below to run "
+                    "this anywhere.", icon=":material/terminal:")
         else:
-            st.error("No reading engine available. Paste an Anthropic API key "
-                     "below, or set one in the app's secrets.",
+            st.error("No reading engine available. Add an Anthropic API key, "
+                     "or point the app at an OpenAI-compatible gateway below.",
                      icon=":material/error:")
 
         st.text_input(
@@ -174,7 +188,30 @@ def sidebar() -> dict:
             "Model", API_MODELS,
             index=API_MODELS.index(DEFAULT_API_MODEL),
             help="Only applies to the Anthropic API engine.",
-            disabled=not api_key_available())
+            disabled=engine != API_BACKEND)
+
+        with st.expander("Use a compatible gateway instead",
+                         expanded=engine == COMPAT_BACKEND):
+            st.caption(
+                "Any service that speaks OpenAI's `/chat/completions` - Open "
+                "WebUI, LiteLLM, vLLM, a university or company AI gateway. "
+                "Used only when no Anthropic key is set.")
+            st.text_input("Base URL", key="gateway_url",
+                          placeholder="https://gateway.example.edu/api",
+                          help="With or without the /chat/completions tail.")
+            st.text_input("Gateway API key", key="gateway_key",
+                          type="password", placeholder="sk-...")
+            st.text_input("Model name", key="gateway_model",
+                          placeholder="claude-sonnet-5",
+                          help="Exactly as the gateway names it - gateways do "
+                               "not agree on a default.")
+            st.text_input(
+                "Extra headers (JSON)", key="gateway_headers",
+                placeholder='{"CF-Access-Client-Id": "...", '
+                            '"CF-Access-Client-Secret": "..."}',
+                help="For a gateway behind Cloudflare Access or similar, put "
+                     "its service-token headers here. An API key alone will "
+                     "not get past Access.")
 
         verify = st.toggle(
             "Read twice and compare", value=False,
@@ -199,16 +236,16 @@ def sidebar() -> dict:
             "each one. All nine metrics are arithmetic done in Python, so no "
             "rating depends on the model's own maths.")
 
-        using_api = api_key_available()
         return {
             # A CLI backend has its own idea of which models exist, and
             # handing it an API model id makes it fail on the server side,
-            # so the picker only reaches the API path.
-            "model": model if using_api else None,
+            # so the picker only reaches the Anthropic API path. The gateway
+            # reads its own model name out of the environment.
+            "model": model if engine == API_BACKEND else None,
             "verify": verify,
             "template_path": template_path,
-            "cli": API_BACKEND if using_api else "auto",
-            "ready": using_api or bool(backends),
+            "cli": engine or "auto",
+            "ready": bool(engine),
         }
 
 
@@ -529,7 +566,7 @@ def main() -> None:
                        page_icon=":material/finance:", layout="wide",
                        initial_sidebar_state="expanded")
     st.markdown(STYLE, unsafe_allow_html=True)
-    load_api_key()
+    load_credentials()
 
     st.markdown(
         '<div class="hero"><h1>ElCap Scorecard Generator</h1>'
