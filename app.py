@@ -29,7 +29,8 @@ from fill_excel import AUDIT_LINE_ITEMS, BASIS_LABELS  # noqa: E402
 from llm_extract import (API_BACKEND, API_MODELS,  # noqa: E402
                          COMPAT_BACKEND, COMPAT_BASE_URL_VAR,
                          COMPAT_HEADERS_VAR, COMPAT_KEY_VAR, COMPAT_MODEL_VAR,
-                         DEFAULT_API_MODEL, available_backends)
+                         DEFAULT_API_MODEL, available_backends,
+                         looks_like_an_anthropic_key)
 from scorecard_pipeline import PipelineError, build_scorecard  # noqa: E402
 
 SAMPLE_PDF = os.path.join(HERE, "sample", "input", "Audited Financial Statements.pdf")
@@ -164,7 +165,18 @@ def sidebar() -> dict:
         backends = available_backends()
         engine = backends[0] if backends else None
 
-        if engine == API_BACKEND:
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if engine == API_BACKEND and not looks_like_an_anthropic_key(anthropic_key):
+            # Caught here rather than at request time: the API answers a
+            # foreign key with a 401 that reads like a revoked key, and the
+            # user has no reason to suspect the key is simply the wrong kind.
+            st.error(
+                "That does not look like an Anthropic key - those start with "
+                "`sk-ant-`. A key from a gateway (Open WebUI, LiteLLM, a "
+                "university AI service) goes under **Use a compatible gateway "
+                "instead** below, together with its base URL.",
+                icon=":material/key_off:")
+        elif engine == API_BACKEND:
             st.success("Anthropic API key detected", icon=":material/check_circle:")
         elif engine == COMPAT_BACKEND:
             st.success("Using the configured gateway",

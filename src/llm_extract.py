@@ -265,11 +265,19 @@ class _ApiRunner:
         try:
             message = self._send(client, request, with_fallbacks=True)
         except Exception as exc:
+            if _is_auth_failure(exc):
+                raise LLMExtractionBackendError(self._explain_auth()) from exc
             if not _is_bad_request(exc):
                 raise
             # Beta flags move. A rejected beta must not cost the user their
             # scorecard, so the same request goes again without it.
-            message = self._send(client, request, with_fallbacks=False)
+            try:
+                message = self._send(client, request, with_fallbacks=False)
+            except Exception as retry_exc:
+                if _is_auth_failure(retry_exc):
+                    raise LLMExtractionBackendError(
+                        self._explain_auth()) from retry_exc
+                raise
 
         if getattr(message, "stop_reason", None) == "refusal":
             detail = getattr(getattr(message, "stop_details", None),
@@ -307,14 +315,60 @@ class _ApiRunner:
             )
         return anthropic.Anthropic(timeout=float(timeout_seconds))
 
+    @staticmethod
+    def _explain_auth() -> str:
+        """Say which key was rejected, and whether it was one at all.
+
+        The usual cause is a key from somewhere else in ANTHROPIC_API_KEY.
+        Every Anthropic key starts with ``sk-ant-``; a bare ``sk-`` key is a
+        gateway's (Open WebUI, LiteLLM, OpenAI), and no amount of retrying
+        will make api.anthropic.com accept it.
+        """
+        key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        if key and not key.startswith(ANTHROPIC_KEY_PREFIX):
+            return (
+                "api.anthropic.com rejected this key, and it is not an "
+                f"Anthropic key: those start with '{ANTHROPIC_KEY_PREFIX}' and "
+                f"this one starts with '{key[:3]}'. A key issued by a gateway "
+                "(Open WebUI, LiteLLM, a university AI service) belongs in "
+                f"{COMPAT_KEY_VAR} alongside {COMPAT_BASE_URL_VAR}, not in "
+                "ANTHROPIC_API_KEY. For the Anthropic API, get a key from "
+                "console.anthropic.com."
+            )
+        return ("api.anthropic.com rejected the API key in ANTHROPIC_API_KEY. "
+                "Check it at console.anthropic.com - it may be revoked, from "
+                "another organisation, or truncated.")
+
     def describe(self) -> str:
         return f"Anthropic API (model={self.model})"
+
+
+#: Every Anthropic API key begins with this.
+ANTHROPIC_KEY_PREFIX = "sk-ant-"
+
+
+def looks_like_an_anthropic_key(key: str) -> bool:
+    """Whether a key could be an Anthropic one. Empty counts as 'not wrong'."""
+    key = (key or "").strip()
+    return not key or key.startswith(ANTHROPIC_KEY_PREFIX)
 
 
 def _is_bad_request(exc: Exception) -> bool:
     """Whether an SDK exception is a 400, as opposed to auth/network/5xx."""
     return (getattr(exc, "status_code", None) == 400
             or type(exc).__name__ == "BadRequestError")
+
+
+def _is_auth_failure(exc: Exception) -> bool:
+    """Whether an SDK exception is a 401/403.
+
+    Worth its own branch: the retry loop treats a failure as transient by
+    default, so without this a rejected key costs three full attempts before
+    reporting a problem that was never going to fix itself.
+    """
+    return (getattr(exc, "status_code", None) in (401, 403)
+            or type(exc).__name__ in ("AuthenticationError",
+                                      "PermissionDeniedError"))
 
 
 # --------------------------------------------------------------------------

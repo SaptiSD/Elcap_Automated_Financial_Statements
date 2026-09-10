@@ -369,3 +369,60 @@ def test_a_cloudflare_access_bounce_is_named(gateway):
 def test_a_rejected_key_and_a_wrong_url_are_told_apart(gateway):
     assert "rejected the API key" in gateway._explain(FakeResponse(status=401))
     assert "Check the base URL" in gateway._explain(FakeResponse(status=404))
+
+
+# --------------------------------------------------------------------------
+# A key from the wrong place
+#
+# The commonest deployment mistake is a gateway key in ANTHROPIC_API_KEY. The
+# API answers that with a 401 that reads exactly like a revoked key, and the
+# retry loop treats a failure as transient, so the report arrives three
+# attempts later and points at the wrong thing.
+# --------------------------------------------------------------------------
+
+from llm_extract import (_ApiRunner, _is_auth_failure,  # noqa: E402
+                         looks_like_an_anthropic_key)
+
+
+class FakeAuthError(Exception):
+    status_code = 401
+
+
+def test_an_anthropic_key_is_told_from_a_gateway_key():
+    assert looks_like_an_anthropic_key("sk-ant-api03-abc")
+    assert not looks_like_an_anthropic_key("sk-3bd31311dfc3461a9fbf4fd7")
+    assert looks_like_an_anthropic_key("")        # unset is not "wrong"
+
+
+def test_auth_failures_are_recognised_by_status_and_by_name():
+    assert _is_auth_failure(FakeAuthError())
+    assert _is_auth_failure(type("AuthenticationError", (Exception,), {})())
+    assert _is_auth_failure(type("PermissionDeniedError", (Exception,), {})())
+    assert not _is_auth_failure(ValueError("nope"))
+
+
+def test_a_foreign_key_is_named_as_the_cause(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-3bd31311dfc3461a9fbf4fd7")
+    message = _ApiRunner._explain_auth()
+    assert "not an Anthropic key" in message
+    assert COMPAT_KEY_VAR in message
+
+
+def test_a_real_looking_key_gets_the_ordinary_explanation(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-abc")
+    message = _ApiRunner._explain_auth()
+    assert "not an Anthropic key" not in message
+    assert "console.anthropic.com" in message
+
+
+def test_a_rejected_key_is_not_retried(monkeypatch):
+    """LLMExtractionBackendError is the 'do not retry' signal, so the
+    conversion has to happen inside the runner, not at the call site."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-abc")
+    runner = _ApiRunner(model="claude-opus-5")
+    monkeypatch.setattr(_ApiRunner, "_client", staticmethod(lambda _t: object()))
+    def boom(*_args, **_kwargs):
+        raise FakeAuthError("API key is invalid.")
+    monkeypatch.setattr(_ApiRunner, "_send", staticmethod(boom))
+    with pytest.raises(LLMExtractionBackendError, match="rejected the API key"):
+        runner.run("prompt", timeout_seconds=5)
